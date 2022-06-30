@@ -33,6 +33,14 @@ Options:
  -d <path> (provide a custom path to a DVRescue XML that corresponds to the
             input file)
 
+To vizualize the relationship between inputs and a merged output (-s, -S, and -b are required):
+ -s <list> (provide a pipe-delimited list of the input files for the merge)
+ -S <list> (provide a pipe-delimited list of the offsets to the input files listed in '-s')
+ 
+ For example `dvplay -s 'file1.dv|file2.dv' -S '120000|240000' -b 240000 output.dv` would show
+ an image that depicts the input frames (at the corresponding offsets of the corresponding input
+ file) with the corresponding merged output frame at the corresponding offset.
+
  -z       (disable colored terminal output)
 EOF
 exit
@@ -76,7 +84,7 @@ _report(){
 OPTIND=1
 FFMPEG_VERBOSE=(-v quiet -stats)
 DV_VERBOSE=false
-while getopts ":t:b:mxgF:M:D:X:d:hvzB:o:O:" OPT ; do
+while getopts ":t:b:mxgF:M:D:X:d:hvzB:o:O:s:S:" OPT ; do
     case "${OPT}" in
         t) FFMPEG_INPUT_OPTS=(-ss ${OPTARG}) ; PTS="$OPTARG" ;;
         b) FFMPEG_INPUT_OPTS=(-skip_initial_bytes ${OPTARG}) ; OFFSET="$OPTARG" ;;
@@ -94,6 +102,8 @@ while getopts ":t:b:mxgF:M:D:X:d:hvzB:o:O:" OPT ; do
         B) BLOCKS="${OPTARG}" ;;
         o) OUTPUTDIR="${OPTARG}";;
         O) OUTPUTFILE="${OPTARG}" ; ERROR_REVIEW="Y" ;;
+        s) INPUTFILE_PATHS="${OPTARG}" ;;
+        S) INPUTFILE_OFFSETS="${OPTARG}" ;;
         :) echo "Option -${OPTARG} requires an argument" ; exit 1 ;;
         *) echo "bad option -${OPTARG}" ; _usage ; exit 1 ;;
     esac
@@ -481,7 +491,7 @@ if [[ -n "${BLOCKS}" ]] ; then
         fi
         X=$((SBx+(WL*MBx)))
         Y=$(((I*48)+(MBy*H)))
-        FILTER+="drawbox=w=${W}:h=${H}:x=${X}:y=${Y}:color=white@0.5:t=1,"
+        FILTER+="drawbox=w=${W}:h=${H}:x=${X}:y=${Y}:color=purple@0.7:t=1,"
     done
     # remove trailing comma
     FILTER="${FILTER%?}"
@@ -549,7 +559,51 @@ while [[ "${@}" != "" ]] ; do
     shift
     IFS="|" read HEIGHT PIX_FMT < <("${MEDIAINFO_PATH}" --Inform="Video;%Height%|%ChromaSubsampling%" "${DVFILE}")
     _get_filters
-    if [[ -n "${OUTPUTFILE}" ]]  ; then
+    if [[ -n "${INPUTFILE_PATHS}" ]] ; then
+        IFS="|" read -ra INPUTFILE_PATH <<< "${INPUTFILE_PATHS}"
+        IFS="|" read -ra INPUTFILE_OFFSET <<< "${INPUTFILE_OFFSETS}"
+        COUNT_INPUT_PATH="${#INPUTFILE_PATH[@]}"
+        COUNT_INPUT_OFFSET="${#INPUTFILE_OFFSET[@]}"
+        COLOR=(red green blue magenta yellow cyan)
+        INPUT_COUNTER=0
+        MAP_COUNTER=0
+        unset INPUT_SET MAP_SET FILTER_SET
+
+        echo "LIST ${INPUTFILE_PATH[*]}"
+        echo "LIST0 ${INPUTFILE_PATH[0]}"
+        echo "LIST1 ${INPUTFILE_PATH[1]}"
+        echo "LIST2 ${INPUTFILE_PATH[2]}"
+        while [[ "${INPUT_COUNTER}" < "${COUNT_INPUT_PATH}" ]]; do
+            echo "ic ${INPUT_COUNTER} cip ${COUNT_INPUT_PATH}"
+            INPUT_SET+=(-skip_initial_bytes "${INPUTFILE_OFFSET[${INPUT_COUNTER}]}" -i "${INPUTFILE_PATH[${INPUT_COUNTER}]}")
+            INPUT_SET+=(-skip_initial_bytes "${INPUTFILE_OFFSET[${INPUT_COUNTER}]}" -i "${INPUTFILE_PATH[${INPUT_COUNTER}]}")
+            MAP_SET+=(-map "${MAP_COUNTER}:v")
+            FILTER_SET+="[0:v:${MAP_COUNTER}]"
+            MAP_COUNTER=$((MAP_COUNTER+1))
+            MAP_SET+=(-map "${MAP_COUNTER}:v")
+            MAP_SET+=("-bsf:v:${MAP_COUNTER}" "dv_error_marker=color=${COLOR[$INPUT_COUNTER]}")
+            FILTER_SET+="[0:v:${MAP_COUNTER}]blend=all_expr='if(eq(mod(X,4),mod(Y,4)),B,A)'[v${INPUT_COUNTER}];"
+            FILTER_OUTS+="[v${INPUT_COUNTER}]"
+            INPUT_COUNTER=$((INPUT_COUNTER+1))
+            MAP_COUNTER=$((MAP_COUNTER+1))
+        done
+        INPUT_SET+=(-skip_initial_bytes "${OFFSET}" -i "${DVFILE}")
+        INPUT_SET+=(-skip_initial_bytes "${OFFSET}" -i "${DVFILE}")
+
+        MAP_SET+=(-map "${MAP_COUNTER}:v")
+        FILTER_SET+="[0:v:${MAP_COUNTER}]"
+        MAP_COUNTER=$((MAP_COUNTER+1))
+        MAP_SET+=(-map "${MAP_COUNTER}:v")
+        MAP_SET+=("-bsf:v:${MAP_COUNTER}" "dv_error_marker=color=${COLOR[$INPUT_COUNTER]}")
+        FILTER_SET+="[0:v:${MAP_COUNTER}]blend=all_expr='if(eq(mod(X,4),mod(Y,4)),B,A)'[v${INPUT_COUNTER}];"
+        FILTER_OUTS+="[v${INPUT_COUNTER}]"
+        INPUT_COUNTER=$((INPUT_COUNTER+1))
+        MAP_COUNTER=$((MAP_COUNTER+1))
+        echo "HEYY ffmpeg ${INPUT_SET[@]} ${MAP_SET[@]} -f nut -c copy - | ffmpeg -i - -lavfi ${FILTER_SET%?};${FILTER_OUTS}xstack=inputs=${INPUT_COUNTER}:layout=0_0|w0_0|0_h0|w0_h0|0_h0+h1|w0_h0+h1 -f nut -frames:v 1 -c:v rawvideo -"
+        ffmpeg "${INPUT_SET[@]}" "${MAP_SET[@]}" -f nut -c copy - | \
+        ffmpeg -i - -lavfi "${FILTER_SET%?};${FILTER_OUTS}xstack=inputs=${INPUT_COUNTER}:layout=0_0|w0_0|0_h0|w0_h0|0_h0+h1|w0_h0+h1" -f nut -frames:v 1 -c:v rawvideo - | \
+        ffplay -
+    elif [[ -n "${OUTPUTFILE}" ]]  ; then
         if [[ "${OUTPUTFILE}" == "-" ]] ; then
             PIPE_FORMAT=(-c:v mjpeg -f image2)
         fi
